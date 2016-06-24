@@ -1,3 +1,4 @@
+
 from abc import ABCMeta, abstractmethod, abstractproperty
 from contextlib import contextmanager
 from functools import wraps
@@ -18,8 +19,12 @@ import tempfile
 from logbook import TestHandler
 from mock import patch
 from nose.tools import nottest
+import numpy as np
+from numpy import float64
 from numpy.testing import assert_allclose, assert_array_equal
 import pandas as pd
+from pandas.util.testing import assert_frame_equal
+from scipy.stats import linregress
 from six import itervalues, iteritems, with_metaclass
 from six.moves import filter, map
 from sqlalchemy import create_engine
@@ -42,16 +47,16 @@ from zipline.data.us_equity_pricing import (
 from zipline.finance.trading import TradingEnvironment
 from zipline.finance.order import ORDER_STATUS
 from zipline.lib.labelarray import LabelArray
+from zipline.pipeline import Pipeline
 from zipline.pipeline.data import USEquityPricing
 from zipline.pipeline.engine import SimplePipelineEngine
 from zipline.pipeline.factors import CustomFactor
 from zipline.pipeline.loaders.testing import make_seeded_random_loader
+from zipline.pipeline.sentinels import NotSpecified
 from zipline.utils import security_list
 from zipline.utils.input_validation import expect_dimensions
 from zipline.utils.sentinel import sentinel
 from zipline.utils.calendars import default_nyse_schedule
-import numpy as np
-from numpy import float64
 
 
 EPOCH = pd.Timestamp(0, tz='UTC')
@@ -1468,6 +1473,94 @@ def ensure_doctest(f, name=None):
         f.__name__ if name is None else name
     ] = f
     return f
+
+
+def run_regression_tests(regression_factor,
+                         regression_length,
+                         returns_columns,
+                         run_pipeline,
+                         dates,
+                         start_date_index,
+                         end_date_index,
+                         mask,
+                         expected_mask,
+                         assets,
+                         my_asset=None):
+    """
+    Helper function for shared testing of `Factor.linear_regression` and the
+    built-in factor `RollingLinearRegressionOfReturns`.
+    """
+    # The order of these is meant to align with the output of `linregress`.
+    outputs = ['beta', 'alpha', 'r_value', 'p_value', 'stderr']
+
+    # Number of days over which to run the regression.
+    num_days = end_date_index - start_date_index + 1
+
+    pipeline = Pipeline(
+        columns={
+            output: getattr(regression_factor, output)
+            for output in outputs
+        },
+    )
+    if mask is not NotSpecified:
+        pipeline.add(mask, 'mask')
+
+    results = run_pipeline(
+        pipeline, dates[start_date_index], dates[end_date_index],
+    )
+    if mask is not NotSpecified:
+        mask_results = results['mask'].unstack()
+        check_arrays(mask_results.values, expected_mask)
+
+    output_results = {}
+    expected_output_results = {}
+    for output in outputs:
+        output_results[output] = results[output].unstack()
+        expected_output_results[output] = np.full_like(
+            output_results[output], np.nan,
+        )
+
+    # Run a separate pipeline that calculates returns starting
+    # (regression_length - 1) days prior to our start date. This is because we
+    # need (regression_length - 1) extra days of returns to compute our
+    # expected regressions.
+    assert sorted(returns_columns.keys()) == ['returns_x', 'returns_y']
+    results = run_pipeline(
+        Pipeline(columns=returns_columns),
+        dates[start_date_index - (regression_length - 1)],
+        dates[end_date_index],
+    )
+
+    returns_x_results = results['returns_x'].unstack()
+    returns_y_results = results['returns_y'].unstack()
+
+    # On each day, calculate the expected regression results for Y ~ X, where Y
+    # is the asset we are interested in and X is each other asset. Each
+    # regression is calculated over `regression_length` days of data.
+    for day in range(num_days):
+        todays_returns_x = returns_x_results.iloc[day:day + regression_length]
+        todays_returns_y = returns_y_results.iloc[day:day + regression_length]
+        for asset, asset_returns_y in todays_returns_y.iteritems():
+            asset_column = int(asset) - 1
+            if my_asset:
+                asset_returns_x = todays_returns_x[my_asset]
+            else:
+                asset_returns_x = todays_returns_x[asset]
+            expected_regression_results = linregress(
+                y=asset_returns_y, x=asset_returns_x,
+            )
+            for i, output in enumerate(outputs):
+                expected_output_results[output][day, asset_column] = \
+                    expected_regression_results[i]
+
+    for output in outputs:
+        output_result = output_results[output]
+        expected_output_result = pd.DataFrame(
+            np.where(expected_mask, expected_output_results[output], np.nan),
+            index=dates[start_date_index:end_date_index + 1],
+            columns=assets,
+        )
+        assert_frame_equal(output_result, expected_output_result)
 
 
 ####################################

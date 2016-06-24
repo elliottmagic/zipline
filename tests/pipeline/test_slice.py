@@ -2,6 +2,7 @@
 Tests for slicing pipeline terms.
 """
 from numpy import (
+    full,
     full_like,
     nan,
     where,
@@ -13,11 +14,7 @@ from pandas import (
     Timestamp,
 )
 from pandas.util.testing import assert_frame_equal
-from scipy.stats import (
-    linregress,
-    pearsonr,
-    spearmanr,
-)
+from scipy.stats import pearsonr, spearmanr
 
 from zipline.assets import Asset
 from zipline.errors import (
@@ -37,18 +34,20 @@ from zipline.pipeline.factors import (
     RollingSpearmanOfReturns,
     SimpleMovingAverage,
 )
+from zipline.pipeline.sentinels import NotSpecified
 from zipline.testing import (
     AssetID,
     AssetIDPlusDay,
     check_arrays,
     OpenPrice,
     parameter_space,
+    run_regression_tests,
 )
 from zipline.testing.fixtures import (
     WithSeededRandomPipelineEngine,
     ZiplineTestCase,
 )
-from zipline.utils.numpy_utils import datetime64ns_dtype
+from zipline.utils.numpy_utils import bool_dtype, datetime64ns_dtype
 
 
 class SliceTestCase(WithSeededRandomPipelineEngine, ZiplineTestCase):
@@ -652,25 +651,18 @@ class StatisticalMethodsTestCase(WithSeededRandomPipelineEngine,
             ),
         )
 
-    def test_factor_regression_method_two_factors(self):
+    @parameter_space(regression_length=[1, 2, 3, 4])
+    def test_factor_regression_method_two_factors(self, regression_length):
         """
         Tests for `Factor.linear_regression` when passed another 2D factor
         instead of a Slice.
         """
-        regression_length = 4
         dates = self.dates
-        start_date = self.pipeline_start_date
-        end_date = self.pipeline_end_date
         start_date_index = self.start_date_index
         end_date_index = self.end_date_index
         num_days = end_date_index - start_date_index + 1
         assets = self.asset_finder.retrieve_all(self.sids)
-
-        # The order of these is meant to align with the output of `linregress`.
-        outputs = ['beta', 'alpha', 'r_value', 'p_value', 'stderr']
-
-        returns_5 = Returns(window_length=5, inputs=[self.col])
-        returns_10 = Returns(window_length=10, inputs=[self.col])
+        num_assets = len(assets)
 
         # Ensure that the `linear_regression` method cannot be called with two
         # 2D factors which have different masks.
@@ -686,63 +678,28 @@ class StatisticalMethodsTestCase(WithSeededRandomPipelineEngine,
                 regression_length=regression_length,
             )
 
+        returns_5 = Returns(window_length=5, inputs=[self.col])
+        returns_10 = Returns(window_length=10, inputs=[self.col])
+        returns_columns = {'returns_x': returns_10, 'returns_y': returns_5}
+
         regression_factor = returns_5.linear_regression(
             target=returns_10, regression_length=regression_length,
         )
-        pipeline = Pipeline(
-            columns={
-                output: getattr(regression_factor, output)
-                for output in outputs
-            },
+
+        mask = NotSpecified
+        expected_mask = full(
+            shape=(num_days, num_assets), fill_value=True, dtype=bool_dtype,
         )
-        results = self.run_pipeline(pipeline, start_date, end_date)
 
-        output_results = {}
-        expected_output_results = {}
-        for output in outputs:
-            output_results[output] = results[output].unstack()
-            expected_output_results[output] = full_like(
-                output_results[output], nan,
-            )
-
-        # Run a separate pipeline that calculates returns starting
-        # (regression_length - 1) days prior to our start date. This is because
-        # we need (regression_length - 1) extra days of returns to compute our
-        # expected regressions.
-        columns = {'returns_5': returns_5, 'returns_10': returns_10}
-        results = self.run_pipeline(
-            Pipeline(columns=columns),
-            dates[start_date_index - (regression_length - 1)],
-            dates[end_date_index],
+        run_regression_tests(
+            regression_factor=regression_factor,
+            regression_length=regression_length,
+            returns_columns=returns_columns,
+            run_pipeline=self.run_pipeline,
+            dates=dates,
+            start_date_index=start_date_index,
+            end_date_index=end_date_index,
+            mask=mask,
+            expected_mask=expected_mask,
+            assets=assets,
         )
-        returns_5_results = results['returns_5'].unstack()
-        returns_10_results = results['returns_10'].unstack()
-
-        # On each day, calculate the expected regression results for Y ~ X
-        # where Y is the asset we are interested in and X is each other asset
-        # Each regression is calculated over `regression_length` days of data.
-        for day in range(num_days):
-            todays_returns_5 = returns_5_results.iloc[
-                day:day + regression_length
-            ]
-            todays_returns_10 = returns_10_results.iloc[
-                day:day + regression_length
-            ]
-            for asset, asset_returns_5 in todays_returns_5.iteritems():
-                asset_column = int(asset) - 1
-                asset_returns_10 = todays_returns_10[asset]
-                expected_regression_results = linregress(
-                    y=asset_returns_5, x=asset_returns_10,
-                )
-                for i, output in enumerate(outputs):
-                    expected_output_results[output][day, asset_column] = \
-                        expected_regression_results[i]
-
-        for output in outputs:
-            output_result = output_results[output]
-            expected_output_result = DataFrame(
-                data=expected_output_results[output],
-                index=dates[start_date_index:end_date_index + 1],
-                columns=assets,
-            )
-            assert_frame_equal(output_result, expected_output_result)

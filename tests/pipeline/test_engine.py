@@ -37,7 +37,7 @@ from pandas import (
 )
 from pandas.compat.chainmap import ChainMap
 from pandas.util.testing import assert_frame_equal
-from scipy.stats.stats import linregress, pearsonr, spearmanr
+from scipy.stats.stats import pearsonr, spearmanr
 from six import iteritems, itervalues
 from toolz import merge
 
@@ -82,6 +82,7 @@ from zipline.testing import (
     OpenPrice,
     parameter_space,
     product_upper_triangle,
+    run_regression_tests,
 )
 from zipline.testing.fixtures import (
     WithAdjustmentReader,
@@ -90,6 +91,7 @@ from zipline.testing.fixtures import (
     ZiplineTestCase,
 )
 from zipline.utils.memoize import lazyval
+from zipline.utils.numpy_utils import bool_dtype
 
 
 class RollingSumDifference(CustomFactor):
@@ -1353,7 +1355,7 @@ class ParameterizedFactorTestCase(WithTradingEnvironment, ZiplineTestCase):
         )
 
         expected_no_mask_result = full(
-            shape=(num_days, num_assets), fill_value=True, dtype=bool,
+            shape=(num_days, num_assets), fill_value=True, dtype=bool_dtype,
         )
 
         masks = cascading_mask, alternating_mask, NotSpecified
@@ -1363,8 +1365,8 @@ class ParameterizedFactorTestCase(WithTradingEnvironment, ZiplineTestCase):
             expected_no_mask_result,
         )
 
-        # The order of these is meant to align with the output of `linregress`.
-        outputs = ['beta', 'alpha', 'r_value', 'p_value', 'stderr']
+        returns = Returns(window_length=returns_length)
+        returns_columns = {'returns_x': returns, 'returns_y': returns}
 
         for mask, expected_mask in zip(masks, expected_mask_results):
             regression_factor = RollingLinearRegressionOfReturns(
@@ -1374,68 +1376,19 @@ class ParameterizedFactorTestCase(WithTradingEnvironment, ZiplineTestCase):
                 mask=mask,
             )
 
-            pipeline = Pipeline(
-                columns={
-                    output: getattr(regression_factor, output)
-                    for output in outputs
-                },
+            run_regression_tests(
+                regression_factor=regression_factor,
+                regression_length=regression_length,
+                returns_columns=returns_columns,
+                run_pipeline=self.engine.run_pipeline,
+                dates=dates,
+                start_date_index=start_date_index,
+                end_date_index=end_date_index,
+                mask=mask,
+                expected_mask=expected_mask,
+                assets=assets,
+                my_asset=my_asset,
             )
-            if mask is not NotSpecified:
-                pipeline.add(mask, 'mask')
-
-            results = self.engine.run_pipeline(
-                pipeline, dates[start_date_index], dates[end_date_index],
-            )
-            if mask is not NotSpecified:
-                mask_results = results['mask'].unstack()
-                check_arrays(mask_results.values, expected_mask)
-
-            output_results = {}
-            expected_output_results = {}
-            for output in outputs:
-                output_results[output] = results[output].unstack()
-                expected_output_results[output] = full_like(
-                    output_results[output], nan,
-                )
-
-            # Run a separate pipeline that calculates returns starting
-            # (regression_length - 1) days prior to our start date. This is
-            # because we need (regression_length - 1) extra days of returns to
-            # compute our expected regressions.
-            returns = Returns(window_length=returns_length)
-            results = self.engine.run_pipeline(
-                Pipeline(columns={'returns': returns}),
-                dates[start_date_index - (regression_length - 1)],
-                dates[end_date_index],
-            )
-            returns_results = results['returns'].unstack()
-
-            # On each day, calculate the expected regression results for Y ~ X
-            # where Y is the asset we are interested in and X is each other
-            # asset. Each regression is calculated over `regression_length`
-            # days of data.
-            for day in range(num_days):
-                todays_returns = returns_results.iloc[
-                    day:day + regression_length
-                ]
-                my_asset_returns = todays_returns.iloc[:, my_asset_column]
-                for asset, other_asset_returns in todays_returns.iteritems():
-                    asset_column = int(asset) - 1
-                    expected_regression_results = linregress(
-                        y=other_asset_returns, x=my_asset_returns,
-                    )
-                    for i, output in enumerate(outputs):
-                        expected_output_results[output][day, asset_column] = \
-                            expected_regression_results[i]
-
-            for output in outputs:
-                output_result = output_results[output]
-                expected_output_result = DataFrame(
-                    where(expected_mask, expected_output_results[output], nan),
-                    index=dates[start_date_index:end_date_index + 1],
-                    columns=assets,
-                )
-                assert_frame_equal(output_result, expected_output_result)
 
     def test_correlation_and_regression_with_bad_asset(self):
         """
